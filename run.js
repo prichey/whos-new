@@ -132,7 +132,7 @@ function buildEmailTextFromChangedPartners(changedPartnersObj) {
   const changed = changedPartnersObj.changed;
 
   if (joined.length > 0) {
-    emailText += '<strong>Joined</strong><br>';
+    emailText += '<p><strong>Joined</strong></p>';
     emailText += '<ul>';
     joined.forEach(function(partnerInfo) {
       emailText += `<li>${partnerInfo}</li>`;
@@ -141,7 +141,7 @@ function buildEmailTextFromChangedPartners(changedPartnersObj) {
   }
 
   if (left.length > 0) {
-    emailText += '<strong>Left</strong><br>';
+    emailText += '<p><strong>Left</strong></p>';
     emailText += '<ul>';
     left.forEach(function(partnerInfo) {
       emailText += `<li>${partnerInfo}</li>`;
@@ -150,7 +150,7 @@ function buildEmailTextFromChangedPartners(changedPartnersObj) {
   }
 
   if (changed.length > 0) {
-    emailText += '<strong>Changed</strong><br>';
+    emailText += '<p><strong>Changed</strong></p>';
     emailText += '<ul>';
     changed.forEach(function(partnerInfo) {
       emailText += `<li>${partnerInfo}</li>`;
@@ -225,7 +225,7 @@ function run() {
       changedPartners.left = leftPartners;
 
       console.log('changes', changedPartners);
-      
+
       const emailText = buildEmailTextFromChangedPartners(changedPartners);
       return asyncSendEmailToGroup(emailText);
     })
