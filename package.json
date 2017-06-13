@@ -16,6 +16,8 @@
     "dotenv": "^4.0.0",
     "fs": "0.0.1-security",
     "lowdb": "^0.16.2",
-    "mailgun-js": "^0.9.1"
+    "mailgun-js": "^0.9.1",
+    "nodemailer": "^4.0.1",
+    "urlencode": "^1.1.0"
   }
 }

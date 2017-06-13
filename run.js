@@ -1,11 +1,14 @@
 require('dotenv').config();
 
+const fs = require('fs');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const urlencode = require('urlencode');
 const mailgun = require('mailgun-js')({
   apiKey  : process.env.MAILGUN_KEY,
   domain  : process.env.MAILGUN_DOMAIN
 });
+const MailComposer = require('nodemailer/lib/mail-composer');
 
 const Promise = require('bluebird');
 const low = require('lowdb');
@@ -31,7 +34,7 @@ function markAllNotCurrent() {
 }
 
 function asyncGetCurrentPartnerListHtml() {
-  return axios.get(process.env.URL, {
+  return axios.get(`${process.env.URL_BASE}/partnerinfo.asp`, {
       auth: {
         username: process.env.AUTH_USER,
         password: process.env.AUTH_PASS
@@ -65,33 +68,40 @@ function asyncParseCurrentPartnerList(resp) {
       $('table.body').find('tr').each(function(i, el) {
         const tds = $(el).find('td');
 
-        let name = $(tds[0]).find('a.body').text().trim();
-        name = getNameFromPossiblyMalformedString(name);
+        const rawName = $(tds[0]).find('a.body').text().trim();
+        const name = getNameFromPossiblyMalformedString(rawName);
 
         if (!name) return;
 
+        const partnerUrl = $(tds[0]).find('a.body').attr('href');
+        const imgUrl = `${process.env.URL_BASE}/emppics/${urlencode(rawName)}.jpg`;
         const number = $(tds[1]).text().trim();
 
         const dbPartner = partners.find({name: name});
         const partner = dbPartner.value();
+        const partnerObj = {
+          name: name,
+          rawName: rawName,
+          nameWithoutSpaces: name.replace(/\s/g, ''),
+          number: number,
+          current: true,
+          url: `${process.env.URL_BASE}/${partnerUrl}`,
+          imgUrl: imgUrl
+        };
+
         if (partner !== undefined) {
           // check if number changed
           if (number !== partner.number) {
             // update it if so
-            changed.push(`${name}: ${number}`);
+            changed.push(partnerObj);
             dbPartner.assign({number: number}).write();
           }
 
           // partner is current
           dbPartner.assign({current: true}).write();
         } else {
-          if (!!number) {
-            joined.push(`${name}: ${number}`);
-          } else {
-            joined.push(name);
-          }
-
-          partners.push({name: name, number: number, current: true}).write();
+          joined.push(partnerObj);
+          partners.push(partnerObj).write();
         }
       });
 
@@ -111,95 +121,136 @@ function getLeftPartnersFromDb() {
   let left = [];
 
   notCurrentPartners.forEach(function(partner) {
-    if (!!partner.number) {
-      left.push(`${partner.name}: ${partner.number}`);
-    } else {
-      left.push(partner.name);
-    }
-
-    dbPartners.remove({name: partner.name}).write();
+    left.push(partner);
+    dbPartner.assign({current: false}).write();
   });
 
   return left;
 }
 
-function buildEmailTextFromChangedPartners(changedPartnersObj) {
-  let emailText = '';
-  if (!changedPartnersObj) return emailText;
-
-  const joined = changedPartnersObj.joined;
-  const left = changedPartnersObj.left;
-  const changed = changedPartnersObj.changed;
-
-  if (joined.length > 0) {
-    emailText += '<p><strong>Joined</strong></p>';
-    emailText += '<ul>';
-    joined.forEach(function(partnerInfo) {
-      emailText += `<li>${partnerInfo}</li>`;
-    });
-    emailText += '</ul><br>';
+function getEmailTextFromPartnerInfo(partnerInfo) {
+  if (!!partnerInfo && !!partnerInfo.name) {
+    if (!!partnerInfo.number) {
+      return `${partnerInfo.name}: ${partnerInfo.number}`;
+    } else {
+      return partnerInfo.name;
+    }
+  } else {
+    return '';
   }
-
-  if (left.length > 0) {
-    emailText += '<p><strong>Left</strong></p>';
-    emailText += '<ul>';
-    left.forEach(function(partnerInfo) {
-      emailText += `<li>${partnerInfo}</li>`;
-    });
-    emailText += '</ul><br>';
-  }
-
-  if (changed.length > 0) {
-    emailText += '<p><strong>Changed</strong></p>';
-    emailText += '<ul>';
-    changed.forEach(function(partnerInfo) {
-      emailText += `<li>${partnerInfo}</li>`;
-    });
-    emailText += '</ul><br>';
-  }
-
-  return emailText;
 }
 
-function asyncSendEmail(emailAddress, text) {
+function asyncBuildEmailFromChangedPartners(changedPartnersObj) {
+  return new Promise(function(resolve, reject) {
+    if (!changedPartnersObj) resolve({
+      text: 'No changed partners this week!',
+      attachments: []
+    });
+
+    const today = new Date();
+    const date = `${today.getMonth() + 1}/${today.getDate()}`;
+
+    let emailConfig = {
+      attachments: [],
+      html: '',
+      from: `Who's New? <${process.env.MAILGUN_SENDER}>`,
+      subject: `Who's New? Weekly Update ${date}`,
+    };
+
+    const partnerGroups = [
+      {
+        name: "Joined",
+        constituents: changedPartnersObj.joined
+      },
+      {
+        name: "Left",
+        constituents: changedPartnersObj.left
+      },
+      {
+        name: "Changed",
+        constituents: changedPartnersObj.changed
+      },
+    ];
+
+    partnerGroups.forEach(function(partnerGroup) {
+      if (partnerGroup.constituents.length > 0) {
+        emailConfig.html += `<p><strong>${partnerGroup.name}</strong></p>`;
+        emailConfig.html += '<ul>';
+
+        partnerGroup.constituents.forEach(function(partnerInfo) {
+          let partnerEmailText = getEmailTextFromPartnerInfo(partnerInfo);
+
+          if (partnerEmailText !== '') {
+            emailConfig.html += '<li>';
+            emailConfig.html += partnerEmailText;
+
+            const fileName = `${partnerInfo.nameWithoutSpaces}.jpg`;
+            const filePath = `./img/${fileName}`;
+
+            if (fs.existsSync(filePath) === true) {
+              emailConfig.attachments.push({
+                filename: fileName,
+                path: `./img/${fileName}`,
+                cid: partnerInfo.nameWithoutSpaces
+              });
+
+              emailConfig.html += `<img style="display: block;" src="cid:${fileName}" />`;
+            }
+            emailConfig.html += '</li>';
+          }
+        });
+
+        emailConfig.html += '</ul><br>';
+      }
+    })
+
+    if (emailConfig.html === '') {
+      emailConfig.html = 'No changes this week!';
+    }
+
+    console.log('Email config:', emailConfig);
+
+    resolve(emailConfig);
+  })
+}
+
+function asyncSendEmail(emailAddress, emailConfig) {
   return new Promise(function(resolve, reject) {
     try {
-      if (!emailAddress) reject('emailAddress must be non-null');
+      if (!emailAddress) reject(new Error('emailAddress must be non-null'));
 
-      if (!text) {
-        text = 'No changes this week!';
-      }
+      emailConfig.to = emailAddress;
 
-      const today = new Date();
-      const date = `${today.getMonth() + 1}/${today.getDate()}`;
-      const email = {
-        from: `Who's New? <${process.env.MAILGUN_SENDER}>`,
-        to: emailAddress,
-        subject: `Who's New? Weekly Update ${date}`,
-        html: text
-      };
+      const email = new MailComposer(emailConfig);
 
-      mailgun.messages().send(email, function(err, body){
-        if(err) {
-          reject(err);
-        } else {
-          resolve('sent an email to ' + email);
-        }
-      });
+      email.compile().build(function(mailBuildError, message) {
+        const mimeData = {
+          to: emailAddress,
+          message: message.toString('ascii')
+        };
+
+        mailgun.messages().sendMime(mimeData, function(err, body) {
+          if (err) {
+            reject(err);
+          } else {
+            resolve('sent an email to ' + emailAddress);
+          }
+        })
+      })
     } catch(e) {
       reject(e);
     }
-  })
+  });
 };
 
-function asyncSendEmailToGroup(text) {
+function asyncSendEmailToGroup(emailConfig) {
   return new Promise(function(resolve, reject) {
     try {
       const recipients = process.env.EMAIL_RECIPIENTS.split(',');
 
       Promise
         .map(recipients, function(recipient) {
-          return asyncSendEmail(recipient, text);
+          return asyncSendEmail(recipient, emailConfig);
         })
         .then(function() {
           resolve('emails successfully sent to group');
@@ -210,6 +261,81 @@ function asyncSendEmailToGroup(text) {
     } catch(e) {
       reject(e);
     }
+  })
+}
+
+function getConcattedAllPartnersListFromChangedPartnersObj(changedPartners) {
+  let allPartners = [];
+  if (!!changedPartners.joined && changedPartners.joined.length > 0) {
+    allPartners = allPartners.concat(changedPartners.joined);
+  }
+  if (!!changedPartners.changed && changedPartners.changed.length > 0) {
+    allPartners = allPartners.concat(changedPartners.changed);
+  }
+  if (!!changedPartners.left && changedPartners.left.length > 0) {
+    allPartners = allPartners.concat(changedPartners.left);
+  }
+  return allPartners;
+}
+
+function asyncDownloadPartnerPhotoIfNecessary(partner) {
+  return new Promise(function(resolve, reject) {
+    if (!!partner && !!partner.nameWithoutSpaces && !!partner.imgUrl) {
+      const imagePath = `./img/${partner.nameWithoutSpaces}.jpg`;
+      if (fs.existsSync(imagePath) !== true) {
+        // file does not exist, attempt to download
+        console.log('attempting to download to ', imagePath)
+        asyncDownloadFile(partner.imgUrl, imagePath)
+          .then(function(res) {
+            resolve(res)
+          })
+          .catch(function(e) {
+            reject(e);
+          })
+      } else {
+        conosle.log('photo already downloaded');
+        resolve('file already downloaded');
+      }
+    } else {
+      reject(new Error('malformed partner'));
+    }
+  });
+}
+
+function asyncDownloadPhotosOfPartnersIfNecessary(changedPartners) {
+  return new Promise(function(resolve, reject) {
+    const allPartners = getConcattedAllPartnersListFromChangedPartnersObj(changedPartners);
+    Promise
+      .map(allPartners, function(partner) {
+        return asyncDownloadPartnerPhotoIfNecessary(partner);
+      })
+      .then(function(res) {
+        resolve(changedPartners)
+      })
+      .catch(function(e) {
+        reject(e);
+      });
+  });
+}
+
+function asyncDownloadFile(url, filename) {
+  return new Promise(function(resolve, reject) {
+    axios({
+      method: 'get',
+      url: url,
+      responseType: 'stream',
+      auth: {
+        username: process.env.AUTH_USER,
+        password: process.env.AUTH_PASS
+      }
+    })
+    .then(function(resp) {
+      resp.data.pipe(fs.createWriteStream(filename))
+    })
+    .then(function() {
+      console.log(`${filename} downloaded`);
+      resolve();
+    });
   })
 }
 
@@ -224,10 +350,20 @@ function run() {
       const leftPartners = getLeftPartnersFromDb();
       changedPartners.left = leftPartners;
 
-      console.log('changes', changedPartners);
-
-      const emailText = buildEmailTextFromChangedPartners(changedPartners);
-      return asyncSendEmailToGroup(emailText);
+      console.log('Changes:', changedPartners);
+      return changedPartners;
+    })
+    .then(function(changedPartners) {
+      return asyncDownloadPhotosOfPartnersIfNecessary(changedPartners)
+    })
+    .then(function(changedPartners) {
+      return asyncBuildEmailFromChangedPartners(changedPartners);
+    })
+    .then(function(emailConfig) {
+      return asyncSendEmailToGroup(emailConfig);
+    })
+    .then(function() {
+      console.log('Success!');
     })
     .catch(function(err) {
       console.error('Error:', err);
